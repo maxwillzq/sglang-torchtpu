@@ -21,7 +21,13 @@ The artifact's inputs map onto the RPA metadata one to one:
 the fused `[num_blocks, page_size, 2 * kv_heads / packing, packing, head_dim]`
 buffer of `TpuFusedMHATokenToKVPool`, which the RPA kernel writes in place.
 
-Supported: dense text decoders on the RPA v3 backend at tensor parallel size 1.
+Under tensor (and expert) parallelism every rank runs this module in its own
+process (`cli`): each traces its own shard-local program, collectives included,
+and the artifact records each tensor's sharding over the `model` mesh axis
+(`abstract_params`, `abstract_states`). The LM head's vocabulary shards are
+gathered in `compute_logits`, so every rank returns full logits.
+
+Supported: text decoders (dense or MoE) on the RPA v3 backend.
 """
 
 from __future__ import annotations
@@ -66,19 +72,33 @@ def default_req_buckets(max_num_seqs: int) -> tuple[int, ...]:
     return tuple(buckets)
 
 
-def load_model_runner(server_args: Any) -> Any:
+def prepare_server_args(server_args: Any) -> Any:
+    """Resolves `server_args` and picks the ports, once, in the launching process.
+
+    As SGLang's engine does before it starts its schedulers: every rank then gets
+    the same resolved arguments and the same `PortArgs`.
+    """
+    from sglang.srt.entrypoints.engine import _set_envs_and_config
+    from sglang.srt.server_args import PortArgs
+
+    server_args.resolve_once()
+    _set_envs_and_config(server_args)
+    return PortArgs.init_new(server_args)
+
+
+def load_model_runner(server_args: Any, tp_rank: int = 0, port_args: Any = None) -> Any:
     """Loads the model of `server_args` on this TPU without a server or scheduler.
 
     The single-rank steps of `sglang.benchmark.one_batch.load_model`: resolve the
     server arguments, publish this process as rank 0, initialize the TPU worker
     and the parallel runtime, then build the `ModelRunner` with its KV pool and
     attention backends. No graph runner is built: the exporter traces the
-    forward itself.
+    forward itself. Under tensor parallelism every rank calls this with its own
+    `tp_rank` and the same `server_args.nccl_port`.
     """
     from sglang.srt.arg_groups.overrides import resolving_view
     from sglang.srt.configs.model_config import ModelConfig
     from sglang.srt.distributed import bootstrap
-    from sglang.srt.entrypoints.engine import _set_envs_and_config
     from sglang.srt.layers.moe import initialize_moe_config
     from sglang.srt.layers.quantization.fp4_utils import initialize_fp4_gemm_config
     from sglang.srt.layers.quantization.fp8_utils import initialize_fp8_gemm_config
@@ -89,25 +109,23 @@ def load_model_runner(server_args: Any) -> Any:
         publish,
         spawn_world_rank,
     )
-    from sglang.srt.server_args import PortArgs
     from sglang.srt.utils.patch_torch import initialize_torch_tpu_worker
 
-    server_args.resolve_once()
-    _set_envs_and_config(server_args)
-    port_args = PortArgs.init_new(server_args)
+    if port_args is None:
+        port_args = prepare_server_args(server_args)
     publish(
         server_args,
         role="scheduler",
         ranks=SpawnRanks(
-            world_rank=spawn_world_rank(server_args, tp_rank=0, pp_rank=0),
-            gpu_id=0,
+            world_rank=spawn_world_rank(server_args, tp_rank=tp_rank, pp_rank=0),
+            gpu_id=tp_rank,
         ),
     )
     initialize_moe_config()
     initialize_fp8_gemm_config()
     initialize_fp4_gemm_config()
 
-    initialize_torch_tpu_worker(server_args, 0)
+    initialize_torch_tpu_worker(server_args, tp_rank)
     cfg = resolving_view(server_args)
     model_config = ModelConfig.from_server_args(server_args)
     bootstrap.init_parallel_runtime(
@@ -119,7 +137,7 @@ def load_model_runner(server_args: Any) -> Any:
     runner = ModelRunner(
         model_config=model_config,
         mem_fraction_static=cfg.mem_fraction_static,
-        gpu_id=0,
+        gpu_id=tp_rank,
         nccl_port=port_args.nccl_port,
         server_args=server_args,
     )
@@ -164,6 +182,7 @@ class SglangExportableLLM(api.ExportableTextOnlyLLM):
         self._patched_rope_modules = rope_patch.patch_in_graph_rotary_embedding(
             self._model
         )
+        self._patched_embeddings = _patch_vocab_shard_bounds(self._model)
         self._forward_batches: dict[int, Any] = {}
 
     # ------------------------------------------------------------------ setup
@@ -182,17 +201,15 @@ class SglangExportableLLM(api.ExportableTextOnlyLLM):
                 "export supports the RPA v3 kernel (its distribution layout is the "
                 "artifact's req_dist); pass --attention-backend pallas_tpu_rpa_v3"
             )
-        tp = int(self._runner.server_args.tp_size)
-        if tp != 1:
-            raise NotImplementedError(
-                f"export supports tensor parallel size 1, got {tp}"
-            )
         state = self._pool.get_state()
         if not isinstance(state, list) or not state:
             raise NotImplementedError(
                 f"export needs a fused per-layer KV pool, got "
                 f"{type(self._pool).__name__}"
             )
+
+    def _tp_size(self) -> int:
+        return int(self._runner.server_args.tp_size)
 
     def _build_export_config(
         self, options: ExportOptions
@@ -216,7 +233,7 @@ class SglangExportableLLM(api.ExportableTextOnlyLLM):
             model_name=str(server_args.served_model_name or server_args.model_path),
             target_tpu=options.target_tpu or _chip_version(),
             num_replicas=1,
-            num_partitions=1,
+            num_partitions=self._tp_size(),
             use_spmd_partitioning=True,
             vocab_size=int(cfg.vocab_size),
             hidden_size=int(cfg.hidden_size),
@@ -250,16 +267,27 @@ class SglangExportableLLM(api.ExportableTextOnlyLLM):
         return self._export_config
 
     def abstract_params(self) -> Mapping[str, api.ShapeDtypeStruct]:
-        """Parameters, then buffers (constants), plus a tied LM head alias.
-
-        At tensor parallel size 1 nothing is sharded.
-        """
+        """Parameters (shard-local shapes, with their sharding), then buffers
+        (constants), plus a tied LM head alias."""
         from sglang_tpu.experimental.export import weight_mapper
 
+        tp = self._tp_size()
+        named = list(self._model.named_parameters())
+        has_ep = any(_is_expert_param(n) for n, _ in named) and self._ep_size() > 1
         params: dict[str, api.ShapeDtypeStruct] = {}
-        for name, param in self._model.named_parameters():
+        for name, param in named:
+            shape = tuple(int(d) for d in param.shape)
+            sharding = _moe_sharding(self._model, name, shape, self._ep_size())
+            if sharding is None:
+                sharding = _attr_sharding(self._model, name, param, len(shape), tp)
+            if sharding is None:
+                sharding = weight_mapper.infer_weight_sharding(
+                    name, shape, model=self._model, tp_size_hint=tp, has_ep_hint=has_ep
+                )
             params[name] = api.ShapeDtypeStruct(
-                shape=tuple(param.shape), dtype=tpu_lowering.dtype_name(param.dtype)
+                shape=shape,
+                dtype=tpu_lowering.dtype_name(param.dtype),
+                sharding=sharding,
             )
         for name, buf in self._model.named_buffers():
             params.setdefault(
@@ -272,6 +300,9 @@ class SglangExportableLLM(api.ExportableTextOnlyLLM):
         if tied:
             params[tied[0]] = params[tied[1]]
         return params
+
+    def _ep_size(self) -> int:
+        return int(getattr(self._runner.server_args, "ep_size", 1) or 1)
 
     def constant_names(self) -> set[str]:
         """Names in `abstract_params()` that are buffers rather than parameters."""
@@ -287,16 +318,29 @@ class SglangExportableLLM(api.ExportableTextOnlyLLM):
                 f"{_MAX_CONSTANT_ELEMENTS}"
             )
         local = buf.detach().cpu().flatten().tolist()
-        return [local[0] if buf.dim() == 0 else local]
+        value = local[0] if buf.dim() == 0 else local
+        if self._tp_size() == 1:
+            return [value]
+        from sglang.srt.distributed import get_tp_group
+
+        group = get_tp_group()
+        values: list[Any] = [None] * group.world_size
+        torch.distributed.all_gather_object(values, value, group=group.cpu_group)
+        return values
 
     def abstract_states(self) -> Sequence[api.ShapeDtypeStruct]:
-        """Each layer's fused KV buffer, with `num_blocks` from the export config."""
+        """Each layer's fused KV buffer, with `num_blocks` from the export config.
+
+        Under tensor parallelism each rank holds its KV heads: the fused heads
+        axis (dim 2) is sharded over `model`, as in vLLM's export.
+        """
         num_blocks = self._export_config.num_blocks
+        heads_axis = "model" if self._tp_size() > 1 else None
         return [
             api.ShapeDtypeStruct(
                 shape=(num_blocks, *tuple(t.shape[1:])),
                 dtype=tpu_lowering.dtype_name(t.dtype),
-                sharding=(None,) * t.dim(),
+                sharding=(None, None, heads_axis, None, None)[: t.dim()],
             )
             for t in self._pool.get_state()
         ]
@@ -473,6 +517,12 @@ class SglangExportableLLM(api.ExportableTextOnlyLLM):
             logits = processor._compute_lm_head_rows(hidden_states, head)
         if processor.logit_scale is not None:
             logits = logits * processor.logit_scale
+        if self._tp_size() > 1:
+            # Each rank projects onto its vocabulary shard; gather them, as the
+            # processor's own gatherer does, so every rank returns full logits.
+            from sglang.srt.distributed import tensor_model_parallel_all_gather
+
+            logits = tensor_model_parallel_all_gather(logits, dim=-1)
         cap = processor.final_logit_softcapping
         if cap:
             logits = cap * torch.tanh(logits / cap)
@@ -481,3 +531,177 @@ class SglangExportableLLM(api.ExportableTextOnlyLLM):
     def sample_tokens(self, logits: Any, **kwargs: Any) -> Any:
         """Samples token ids `i64[R, 1]` from `logits[R, vocab_size]`."""
         return sampling.dispatch_sample_tokens(logits, **kwargs)
+
+
+_SCALE_SUFFIXES = ("_scale_inv", "_scale")
+# Parameter attributes SGLang's parallel layers set on the dim they split.
+_SHARD_ATTRS = (
+    ("ep_dim", "ep"),
+    ("tp_dim", "tp"),
+    ("output_dim", "tp"),
+    ("input_dim", "tp"),
+)
+
+
+def _attr_sharding(
+    model: nn.Module, name: str, param: Any, rank: int, tp_size: int
+) -> list[str | None] | None:
+    """Sharding of an SGLang parallel-layer parameter, from its layer and attributes.
+
+    SGLang keeps linear weights as `[out, in]` and sets both `output_dim` and
+    `input_dim` on them, so the attribute alone does not say which one is split:
+    the layer does. A column-parallel layer has `output_size_per_partition <
+    output_size` (split `output_dim`), a row-parallel one `input_size_per_partition
+    < input_size` (split `input_dim`); vocabulary embeddings and heads split
+    `output_dim`. (vllm-torchtpu transposes its weights; `weight_mapper` flips the
+    attributes for that and does not apply here.) None when the parameter has no
+    shard attribute.
+    """
+    if rank == 0:
+        return None
+    dims = {attr: getattr(param, attr, None) for attr, _ in _SHARD_ATTRS}
+    dims = {a: d for a, d in dims.items() if isinstance(d, int) and 0 <= d < rank}
+    if not dims:
+        return None
+    sharding: list[str | None] = [None] * rank
+    if "ep_dim" in dims:
+        sharding[dims["ep_dim"]] = "ep"
+        return sharding
+    if tp_size <= 1:
+        return sharding
+    if "tp_dim" in dims:
+        sharding[dims["tp_dim"]] = "tp"
+        return sharding
+    module = dict(model.named_modules()).get(name.rsplit(".", 1)[0])
+    split = None
+    in_full, in_part = (
+        getattr(module, k, None) for k in ("input_size", "input_size_per_partition")
+    )
+    out_full, out_part = (
+        getattr(module, k, None) for k in ("output_size", "output_size_per_partition")
+    )
+    if in_full is not None and in_part is not None and in_part < in_full:
+        split = "input_dim"
+    elif out_full is not None and out_part is not None and out_part < out_full:
+        split = "output_dim"
+    elif hasattr(module, "num_embeddings_per_partition") or hasattr(
+        module, "org_vocab_size"
+    ):
+        split = "output_dim"
+    if split in dims:
+        sharding[dims[split]] = "tp"
+    return sharding
+
+
+def _is_expert_param(name: str) -> bool:
+    leaf = name.rsplit(".", 1)[-1]
+    return ".experts." in name and leaf.split("_", 1)[0] in ("w13", "w1", "w2", "w3")
+
+
+def _moe_sharding(
+    model: nn.Module, name: str, shape: tuple[int, ...], ep_size: int
+) -> list[str | None] | None:
+    """Sharding of a fused-MoE expert tensor, or None for anything else.
+
+    SGLang keeps a MoE layer's experts as stacked `w13_*` (gate and up; `w1`/`w3`
+    when separate) and `w2_*` (down) tensors, `[num_experts, ...]`, with their
+    scales beside them. With expert parallelism (the layer's `moe_ep_size`) each
+    rank holds a slice of the experts, dim 0. Otherwise tensor parallelism splits
+    the intermediate dimension: the dim whose size is the layer's per-rank
+    intermediate size (twice that for `w13`), found by size because the TPU MoE
+    kernels may keep the weights transposed. A scale tensor is sharded like its
+    weight.
+    """
+    del ep_size
+    if not _is_expert_param(name) or len(shape) < 2:
+        return None
+    module_name, leaf = name.rsplit(".", 1)
+    module = dict(model.named_modules()).get(module_name)
+    if module is None:
+        return None
+    sharding: list[str | None] = [None] * len(shape)
+    if int(getattr(module, "moe_ep_size", 1) or 1) > 1:
+        sharding[0] = "ep"
+        return sharding
+    if int(getattr(module, "moe_tp_size", 1) or 1) <= 1:
+        return sharding
+    weight_leaf = leaf
+    for suffix in _SCALE_SUFFIXES:
+        if leaf.endswith(suffix):
+            weight_leaf = leaf[: -len(suffix)]
+            break
+    weight = getattr(module, weight_leaf, None)
+    weight_shape = tuple(weight.shape) if isinstance(weight, torch.Tensor) else shape
+    per_rank = getattr(module, "intermediate_size_per_partition", None)
+    if per_rank is None:
+        return sharding
+    target = 2 * int(per_rank) if weight_leaf.startswith("w13") else int(per_rank)
+    dims = [d for d in range(1, len(weight_shape)) if weight_shape[d] == target]
+    if len(dims) != 1:
+        raise NotImplementedError(
+            f"cannot tell which dim of {name} {shape} tensor parallelism splits "
+            f"(per-rank intermediate size {per_rank})"
+        )
+    if dims[0] < len(shape):
+        sharding[dims[0]] = "tp"
+    return sharding
+
+
+_VOCAB_BOUNDS = (
+    "org_vocab_start_index",
+    "org_vocab_end_index",
+    "num_org_vocab_padding",
+    "added_vocab_start_index",
+    "added_vocab_end_index",
+)
+
+
+def _patch_vocab_shard_bounds(model: nn.Module) -> int:
+    """Makes each vocab-parallel embedding read its shard bounds from buffers.
+
+    SGLang keeps a rank's vocabulary range as Python ints (`shard_indices`), which
+    tracing bakes into the graph, so rank 0's program would mask every rank's
+    tokens with rank 0's range. The bounds become int32 scalar buffers instead:
+    the exporter turns per-rank buffer values into a constant input sharded over
+    the mesh (`constant_axis_values`), so each device reads its own. Only
+    embeddings that look tokens up are patched; an LM head projects in
+    `compute_logits` and needs no bounds.
+    """
+    from sglang.srt.layers.vocab_parallel_embedding import (
+        ParallelLMHead,
+        VocabParallelEmbedding,
+        get_masked_input_and_mask,
+    )
+
+    patched = 0
+    for _, module in model.named_modules():
+        if not isinstance(module, VocabParallelEmbedding) or isinstance(
+            module, ParallelLMHead
+        ):
+            continue
+        if int(getattr(module, "tp_size", 1) or 1) <= 1:
+            continue
+        device = module.weight.device
+        for bound in _VOCAB_BOUNDS:
+            value = int(getattr(module.shard_indices, bound))
+            module.register_buffer(
+                bound,
+                torch.tensor(value, dtype=torch.int32, device=device),
+                persistent=False,
+            )
+
+        def embed_local_shard(
+            input_: torch.Tensor, module: Any = module
+        ) -> torch.Tensor:
+            masked, mask = get_masked_input_and_mask(
+                input_, *(getattr(module, b) for b in _VOCAB_BOUNDS)
+            )
+            out = module.quant_method.embedding(module, masked.long())
+            out = out.masked_fill(mask.unsqueeze(-1), 0)
+            if module.output_dtype is not None:
+                out = out.to(module.output_dtype)
+            return out
+
+        module._embed_local_shard = embed_local_shard
+        patched += 1
+    return patched

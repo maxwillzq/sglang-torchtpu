@@ -83,7 +83,7 @@ def test_abstract_states_declare_the_fused_kv_buffers_at_num_blocks():
     assert len(states) == 2
     assert states[0].shape == (33, 16, 2, 2, 128)
     assert states[0].dtype == "bf16"
-    assert states[0].sharding == (None,) * 5
+    assert states[0].sharding == (None,) * 5  # replicated at TP 1
 
 
 def test_fit_num_blocks_keeps_the_padding_page():
