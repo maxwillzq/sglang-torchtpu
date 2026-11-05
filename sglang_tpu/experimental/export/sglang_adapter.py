@@ -75,6 +75,7 @@ def load_model_runner(server_args: Any) -> Any:
     attention backends. No graph runner is built: the exporter traces the
     forward itself.
     """
+    from sglang.srt.arg_groups.overrides import resolving_view
     from sglang.srt.configs.model_config import ModelConfig
     from sglang.srt.distributed import bootstrap
     from sglang.srt.entrypoints.engine import _set_envs_and_config
@@ -82,7 +83,6 @@ def load_model_runner(server_args: Any) -> Any:
     from sglang.srt.layers.quantization.fp4_utils import initialize_fp4_gemm_config
     from sglang.srt.layers.quantization.fp8_utils import initialize_fp8_gemm_config
     from sglang.srt.model_executor.model_runner import ModelRunner
-    from sglang.srt.arg_groups.overrides import resolving_view
     from sglang.srt.runtime_context import (
         SpawnRanks,
         get_device,
@@ -194,7 +194,9 @@ class SglangExportableLLM(api.ExportableTextOnlyLLM):
                 f"{type(self._pool).__name__}"
             )
 
-    def _build_export_config(self, options: ExportOptions) -> api.TextOnlyLLMExportConfig:
+    def _build_export_config(
+        self, options: ExportOptions
+    ) -> api.TextOnlyLLMExportConfig:
         runner = self._runner
         cfg = runner.model_config
         hf = cfg.hf_config
@@ -202,7 +204,9 @@ class SglangExportableLLM(api.ExportableTextOnlyLLM):
         kv = self._pool.get_state()[0]
         page_size = int(kv.shape[1])
         if page_size != int(runner.page_size):
-            raise ValueError(f"KV page size {page_size} != runner page size {runner.page_size}")
+            raise ValueError(
+                f"KV page size {page_size} != runner page size {runner.page_size}"
+            )
         max_num_seqs = int(runner.req_to_token_pool.size)
         max_model_len = int(cfg.context_len)
         eos = getattr(hf, "eos_token_id", None)
@@ -300,8 +304,12 @@ class SglangExportableLLM(api.ExportableTextOnlyLLM):
     def fit_num_blocks(self, num_blocks: int) -> None:
         """Declares `num_blocks` KV blocks per layer instead of SGLang's pool size."""
         if num_blocks < 2:
-            raise ValueError(f"num_blocks must be >= 2 (page 0 is padding), got {num_blocks}")
-        self._export_config = dataclasses.replace(self._export_config, num_blocks=num_blocks)
+            raise ValueError(
+                f"num_blocks must be >= 2 (page 0 is padding), got {num_blocks}"
+            )
+        self._export_config = dataclasses.replace(
+            self._export_config, num_blocks=num_blocks
+        )
 
     # ---------------------------------------------------------------- forward
 
@@ -373,7 +381,9 @@ class SglangExportableLLM(api.ExportableTextOnlyLLM):
             torch.arange(cfg.max_num_seqs + 1, dtype=torch.int32, device=kv_lens.device)
             * stride
         )
-        active = query_start_loc.index_select(0, req_dist[2:3].to(torch.int64)).reshape(())
+        active = query_start_loc.index_select(0, req_dist[2:3].to(torch.int64)).reshape(
+            ()
+        )
         return PallasForwardMetadata(
             kv_lens=kv_lens,
             cu_q_lens=query_start_loc,
@@ -384,7 +394,9 @@ class SglangExportableLLM(api.ExportableTextOnlyLLM):
         )
 
     @contextlib.contextmanager
-    def _bound(self, weights: Mapping[str, Any], kv_caches: Sequence[Any]) -> Iterator[None]:
+    def _bound(
+        self, weights: Mapping[str, Any], kv_caches: Sequence[Any]
+    ) -> Iterator[None]:
         """Binds `weights` into the model and `kv_caches` into the KV pool."""
         from torch.nn.utils.stateless import _reparametrize_module
 

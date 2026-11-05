@@ -45,7 +45,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     ServerArgs.add_cli_args(parser)
     group = parser.add_argument_group("Export Options")
-    group.add_argument("--output-dir", required=True, help="Artifact directory to write.")
+    group.add_argument(
+        "--output-dir", required=True, help="Artifact directory to write."
+    )
     group.add_argument(
         "--export-mode",
         choices=EXPORT_MODES,
@@ -70,7 +72,9 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="KV blocks per layer the artifact declares (default: SGLang's pool).",
     )
-    group.add_argument("--target-tpu", default=None, help="TPU generation (default: detected).")
+    group.add_argument(
+        "--target-tpu", default=None, help="TPU generation (default: detected)."
+    )
     return parser
 
 
@@ -88,7 +92,9 @@ def parse_args(argv: Sequence[str]) -> tuple[argparse.Namespace, Any]:
     return args, server_args
 
 
-def run_export(args: argparse.Namespace, server_args: Any) -> api.TextOnlyLLMExportConfig:
+def run_export(
+    args: argparse.Namespace, server_args: Any
+) -> api.TextOnlyLLMExportConfig:
     if args.export_mode == "all":
         # Before any JAX use: the Pallas kernels the model loads with use JAX.
         checkpoint.init_jax(0, 1, None)
@@ -103,7 +109,9 @@ def run_export(args: argparse.Namespace, server_args: Any) -> api.TextOnlyLLMExp
     )
     if args.num_blocks is not None:
         exportable.fit_num_blocks(args.num_blocks)
-    weights = checkpoint.host_tensors(exportable.model) if args.export_mode == "all" else None
+    weights = (
+        checkpoint.host_tensors(exportable.model) if args.export_mode == "all" else None
+    )
     exporter.export(exportable, args.output_dir)
     if weights is not None:
         checkpoint.save_model_checkpoint(

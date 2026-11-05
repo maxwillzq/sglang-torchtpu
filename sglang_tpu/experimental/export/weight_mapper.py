@@ -15,11 +15,10 @@
 
 from __future__ import annotations
 
-import os
 import contextlib
+import os
 from collections.abc import Iterable, Sequence
 from typing import Any
-
 
 
 def _resolve_submod_and_param(
@@ -174,7 +173,9 @@ def infer_weight_sharding(
         return [None]
 
     if rank == 2:
-        if ".in_proj_qkvz." in weight_name and os.environ.get("TPU_GDN_QKVZ_KERNEL_LAYOUT"):
+        if ".in_proj_qkvz." in weight_name and os.environ.get(
+            "TPU_GDN_QKVZ_KERNEL_LAYOUT"
+        ):
             # TODO: shard dim 1 once this reads the layer's layout marker
             # (`exporter.py` calls this without the model).
             raise NotImplementedError(
