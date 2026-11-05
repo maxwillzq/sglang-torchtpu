@@ -27,7 +27,17 @@ and the artifact records each tensor's sharding over the `model` mesh axis
 (`abstract_params`, `abstract_states`). The LM head's vocabulary shards are
 gathered in `compute_logits`, so every rank returns full logits.
 
-Supported: text decoders (dense or MoE) on the RPA v3 backend.
+Hybrid models (Gated DeltaNet linear-attention layers between full-attention
+layers, e.g. Qwen3.5) run SGLang's `HybridLinearAttnBackend`: the full layers'
+KV caches stay as above, and each linear layer adds its conv and recurrent state
+`[num_state_slots, ...]`, null slot 0, selected per request by the
+`mamba_state_indices` input. The artifact lists the states per layer in layer
+order (`[L0.conv, L0.rec, ..., L3.kv, ...]`, as vLLM's export does); SGLang keeps
+them as the full KV caches, then every conv, then every recurrent state, so the
+adapter permutes between the two.
+
+Supported: text decoders (dense, MoE, or hybrid GDN without speculative
+decoding) on the RPA v3 backend.
 """
 
 from __future__ import annotations
@@ -176,7 +186,21 @@ class SglangExportableLLM(api.ExportableTextOnlyLLM):
         self._runner = model_runner
         self._model: nn.Module = model_runner.model
         self._backend = model_runner.attn_backend
-        self._pool = model_runner.token_to_kv_pool
+        self._hybrid = _is_hybrid_backend(self._backend)
+        if self._hybrid:
+            from sglang_tpu.compilation.hybrid_linear_direct_compile import (
+                hybrid_linear_kv_pool_state,
+            )
+
+            self._rpa = self._backend.full_attn_backend
+            self._pool = hybrid_linear_kv_pool_state(
+                kv_pool=model_runner.token_to_kv_pool,
+                req_to_token_pool=model_runner.req_to_token_pool,
+            )
+        else:
+            self._rpa = self._backend
+            self._pool = model_runner.token_to_kv_pool
+        self._layout = self._state_layout()
         self._check_supported()
         self._export_config = self._build_export_config(options)
         self._patched_rope_modules = rope_patch.patch_in_graph_rotary_embedding(
@@ -190,13 +214,13 @@ class SglangExportableLLM(api.ExportableTextOnlyLLM):
     def _check_supported(self) -> None:
         from sglang_tpu.attention_pallas_rpa_base import BaseTpuPallasRpaAttnBackend
 
-        if not isinstance(self._backend, BaseTpuPallasRpaAttnBackend):
+        if not isinstance(self._rpa, BaseTpuPallasRpaAttnBackend):
             raise NotImplementedError(
                 f"export supports the Pallas RPA attention backends, got "
-                f"{type(self._backend).__name__}; pass --attention-backend "
+                f"{type(self._rpa).__name__}; pass --attention-backend "
                 "pallas_tpu_rpa_v3"
             )
-        if self._backend.kernel_spec.is_batched:
+        if self._rpa.kernel_spec.is_batched:
             raise NotImplementedError(
                 "export supports the RPA v3 kernel (its distribution layout is the "
                 "artifact's req_dist); pass --attention-backend pallas_tpu_rpa_v3"
@@ -211,6 +235,38 @@ class SglangExportableLLM(api.ExportableTextOnlyLLM):
     def _tp_size(self) -> int:
         return int(self._runner.server_args.tp_size)
 
+    def _state_layout(self) -> list[tuple[str, int]]:
+        """The artifact's states in order, each as (kind, index into SGLang's list).
+
+        Kinds: `kv` (a full-attention layer's KV cache), `conv` and `rec` (a
+        linear layer's conv and recurrent state). SGLang's list is the full KV
+        caches, then each conv kind's states, then the recurrent states.
+        """
+        state = self._pool.get_state()
+        if not self._hybrid:
+            return [("kv", i) for i in range(len(state))]
+        full = self._runner.token_to_kv_pool.full_attention_layer_id_mapping
+        linear = self._runner.req_to_token_pool.mamba_map
+        num_full, num_linear = len(full), len(linear)
+        if len(state) != num_full + 2 * num_linear:
+            raise NotImplementedError(
+                f"export supports one conv state per linear layer (Gated DeltaNet); "
+                f"got {len(state)} state tensors for {num_full} full and "
+                f"{num_linear} linear layers"
+            )
+        layout: list[tuple[str, int]] = []
+        for layer_id in sorted({*full, *linear}):
+            if layer_id in full:
+                layout.append(("kv", full[layer_id]))
+            else:
+                j = linear[layer_id]
+                layout += [("conv", num_full + j), ("rec", num_full + num_linear + j)]
+        return layout
+
+    def _kv_tensor(self) -> torch.Tensor:
+        state = self._pool.get_state()
+        return next(state[i] for kind, i in self._layout if kind == "kv")
+
     def _build_export_config(
         self, options: ExportOptions
     ) -> api.TextOnlyLLMExportConfig:
@@ -218,7 +274,7 @@ class SglangExportableLLM(api.ExportableTextOnlyLLM):
         cfg = runner.model_config
         hf = cfg.hf_config
         server_args = runner.server_args
-        kv = self._pool.get_state()[0]
+        kv = self._kv_tensor()
         page_size = int(kv.shape[1])
         if page_size != int(runner.page_size):
             raise ValueError(
@@ -237,7 +293,7 @@ class SglangExportableLLM(api.ExportableTextOnlyLLM):
             use_spmd_partitioning=True,
             vocab_size=int(cfg.vocab_size),
             hidden_size=int(cfg.hidden_size),
-            num_layers=len(self._pool.get_state()),
+            num_layers=sum(1 for kind, _ in self._layout if kind != "rec"),
             num_q_heads=int(cfg.num_attention_heads),
             num_kv_heads=int(cfg.get_total_num_kv_heads()),
             head_dim=int(cfg.head_dim),
@@ -329,21 +385,49 @@ class SglangExportableLLM(api.ExportableTextOnlyLLM):
         return values
 
     def abstract_states(self) -> Sequence[api.ShapeDtypeStruct]:
-        """Each layer's fused KV buffer, with `num_blocks` from the export config.
+        """The artifact's state tensors in layer order (`_state_layout`).
 
-        Under tensor parallelism each rank holds its KV heads: the fused heads
-        axis (dim 2) is sharded over `model`, as in vLLM's export.
+        A KV cache is `[num_blocks, ...]`; under tensor parallelism each rank holds
+        its KV heads, so the fused heads axis (dim 2) is sharded over `model`, as
+        in vLLM's export. A linear layer's conv state `[num_state_slots, K-1, 1,
+        conv_dim]` is sharded on its channels and its recurrent state
+        `[num_state_slots, n_v, d_k, d_v]` on its value heads.
         """
-        num_blocks = self._export_config.num_blocks
-        heads_axis = "model" if self._tp_size() > 1 else None
-        return [
-            api.ShapeDtypeStruct(
-                shape=(num_blocks, *tuple(t.shape[1:])),
-                dtype=tpu_lowering.dtype_name(t.dtype),
-                sharding=(None, None, heads_axis, None, None)[: t.dim()],
+        cfg = self._export_config
+        tp = self._tp_size() > 1
+        state = self._pool.get_state()
+        specs = []
+        for kind, i in self._layout:
+            t = state[i]
+            if kind == "kv":
+                lead, shard = (
+                    cfg.num_blocks,
+                    (None, None, "model" if tp else None, None, None),
+                )
+            elif kind == "conv":
+                lead, shard = (
+                    cfg.num_state_slots,
+                    (None, None, None, "model" if tp else None),
+                )
+            else:
+                lead, shard = (
+                    cfg.num_state_slots,
+                    (None, "model" if tp else None, None, None),
+                )
+            specs.append(
+                api.ShapeDtypeStruct(
+                    shape=(lead, *tuple(t.shape[1:])),
+                    dtype=tpu_lowering.dtype_name(t.dtype),
+                    sharding=shard[: t.dim()],
+                )
             )
-            for t in self._pool.get_state()
-        ]
+        return specs
+
+    def extra_user_inputs(self) -> list[tuple[str, tuple[int, ...]]]:
+        """Hybrid models take each request's recurrent state slot after the states."""
+        if not self._hybrid:
+            return []
+        return [("mamba_state_indices", (self._export_config.max_num_seqs,))]
 
     def fit_num_blocks(self, num_blocks: int) -> None:
         """Declares `num_blocks` KV blocks per layer instead of SGLang's pool size."""
@@ -449,13 +533,34 @@ class SglangExportableLLM(api.ExportableTextOnlyLLM):
             for k, v in weights.items()
             if not k.startswith("lm_head.") and isinstance(v, torch.Tensor)
         }
+        call_weights.update(_aliases(self._model, call_weights))
         saved_state = self._pool.get_state()
-        self._pool.set_state(list(kv_caches))
+        self._pool.set_state(self._to_sglang_order(kv_caches))
         try:
-            with _reparametrize_module(self._model, call_weights, strict=False):
+            with contextlib.ExitStack() as stack:
+                stack.enter_context(
+                    _reparametrize_module(self._model, call_weights, strict=False)
+                )
+                if self._hybrid:
+                    from sglang_tpu.compilation.hybrid_linear_direct_compile import (
+                        bind_traced_conv_weights,
+                    )
+
+                    # The linear layers' conv_weights view conv1d.weight: re-derive
+                    # them from the bound weight.
+                    stack.enter_context(bind_traced_conv_weights(self._model))
                 yield
         finally:
             self._pool.set_state(saved_state)
+
+    def _to_sglang_order(self, states: Sequence[Any]) -> list[Any]:
+        out: list[Any] = [None] * len(self._layout)
+        for t, (_, i) in zip(states, self._layout, strict=True):
+            out[i] = t
+        return out
+
+    def _from_sglang_order(self, states: Sequence[Any]) -> list[Any]:
+        return [states[i] for _, i in self._layout]
 
     def forward(
         self,
@@ -471,10 +576,14 @@ class SglangExportableLLM(api.ExportableTextOnlyLLM):
         **extra_controls: Any,
     ) -> tuple[Sequence[Any], Any]:
         """One continuous-batching step: SGLang's decoder over the artifact's inputs."""
+        mamba_state_indices = extra_controls.pop("mamba_state_indices", None)
         if extra_controls:
             raise NotImplementedError(
-                f"SGLang export takes no extra controls, got {sorted(extra_controls)}"
+                f"SGLang export takes no extra controls besides mamba_state_indices, "
+                f"got {sorted(extra_controls)}"
             )
+        if self._hybrid and mamba_state_indices is None:
+            raise ValueError("a hybrid model's forward needs mamba_state_indices")
         from sglang.srt.model_executor.forward_context import (
             ForwardContext,
             forward_context,
@@ -491,7 +600,7 @@ class SglangExportableLLM(api.ExportableTextOnlyLLM):
         backbone = self._model.model
         with (
             self._bound(weights, kv_caches),
-            self._backend.bind_forward_metadata(metadata, batch.forward_mode),
+            self._bind_metadata(metadata, mamba_state_indices, batch.forward_mode),
             forward_context(ForwardContext(attn_backend=self._backend)),
         ):
             hidden = backbone(
@@ -499,8 +608,37 @@ class SglangExportableLLM(api.ExportableTextOnlyLLM):
             )
             if isinstance(hidden, tuple):
                 hidden = hidden[0]
-            updated = list(self._pool.get_state())
+            updated = self._from_sglang_order(self._pool.get_state())
         return updated, hidden
+
+    def _bind_metadata(
+        self, rpa_metadata: Any, mamba_state_indices: Any, mode: Any
+    ) -> Any:
+        """Installs the attention metadata (and, for a hybrid model, the GDN's)."""
+        if not self._hybrid:
+            return self._rpa.bind_forward_metadata(rpa_metadata, mode)
+        from sglang_tpu.attention_gdn_pallas import GdnTracedMetadata
+        from sglang_tpu.compilation.hybrid_linear_direct_compile import (
+            bind_traced_attention_metadata,
+        )
+
+        req_dist = rpa_metadata.distribution
+        # Every request in the GDN's per-sequence segment: the backend runs one
+        # kernel segment per forward (`prefill_only` outside decode), so a decode
+        # range [0, req_dist[0]) would be skipped. Correct for decodes too, if
+        # slower than the batched decode segment.
+        # TODO: a mode of TpuGDNAttnBackend that runs both segments.
+        zeros = torch.zeros(2, dtype=req_dist.dtype, device=req_dist.device)
+        gdn = GdnTracedMetadata(
+            distribution=torch.cat([zeros, req_dist[2:3]]),
+            seq_lens=rpa_metadata.kv_lens,
+            state_indices=mamba_state_indices.to(torch.int32),
+            query_start_loc=rpa_metadata.cu_q_lens,
+            track_indices=None,
+            track_end=None,
+            read_offsets=None,
+        )
+        return bind_traced_attention_metadata(self._backend, (rpa_metadata, gdn), mode)
 
     def compute_logits(self, hidden_states: Any, lm_head_weight: Any) -> Any:
         """Logits as SGLang's `LogitsProcessor` computes them, trimmed to the vocabulary.
@@ -706,3 +844,36 @@ def _patch_vocab_shard_bounds(model: nn.Module) -> int:
         module._embed_local_shard = embed_local_shard
         patched += 1
     return patched
+
+
+def _is_hybrid_backend(backend: Any) -> bool:
+    try:
+        from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
+            HybridLinearAttnBackend,
+        )
+    except ImportError:
+        return False
+    return isinstance(backend, HybridLinearAttnBackend)
+
+
+def _aliases(model: nn.Module, weights: Mapping[str, Any]) -> dict[str, Any]:
+    """`weights` under every other name the same parameter or buffer has.
+
+    A module may hold another module's parameter as its own (SGLang's
+    `RadixLinearAttention` keeps its layer's `A_log`, `dt_bias` and conv bias), so
+    the tensor is registered twice; `named_parameters()` lists it once, and binding
+    only that name would leave the other reading the eager tensor.
+    """
+    out: dict[str, Any] = {}
+    for named in (model.named_parameters, model.named_buffers):
+        canonical = {id(t): n for n, t in named()}
+        for name, tensor in named(remove_duplicate=False):
+            first = canonical.get(id(tensor))
+            if (
+                first is not None
+                and first != name
+                and first in weights
+                and name not in weights
+            ):
+                out[name] = weights[first]
+    return out
