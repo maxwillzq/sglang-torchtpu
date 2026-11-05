@@ -595,7 +595,8 @@ def _attr_sharding(
 
 def _is_expert_param(name: str) -> bool:
     leaf = name.rsplit(".", 1)[-1]
-    return ".experts." in name and leaf.split("_", 1)[0] in ("w13", "w1", "w2", "w3")
+    in_experts = name.startswith("experts.") or ".experts." in name
+    return in_experts and leaf.split("_", 1)[0] in ("w13", "w1", "w2", "w3")
 
 
 def _moe_sharding(
