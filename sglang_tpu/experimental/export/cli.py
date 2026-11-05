@@ -86,6 +86,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         checkpoint.JAX_COORDINATOR_FLAG, default=None, help=argparse.SUPPRESS
     )
+    group.add_argument(
+        "--debug-taps",
+        default="",
+        help="Comma-separated glob patterns of module names whose outputs the smallest "
+        "bucket's forward also returns, in assets.extra/debug/ (see README).",
+    )
     return parser
 
 
@@ -127,7 +133,8 @@ def run_export(
     weights = (
         checkpoint.host_tensors(exportable.model) if args.export_mode == "all" else None
     )
-    exporter.export(exportable, args.output_dir)
+    taps = [p for p in (args.debug_taps or "").split(",") if p]
+    exporter.export(exportable, args.output_dir, debug_taps=taps)
     if weights is not None:
         checkpoint.save_model_checkpoint(
             weights,
