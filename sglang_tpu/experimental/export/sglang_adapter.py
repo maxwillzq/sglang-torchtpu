@@ -69,14 +69,28 @@ def default_req_buckets(max_num_seqs: int) -> tuple[int, ...]:
 def load_model_runner(server_args: Any) -> Any:
     """Loads the model of `server_args` on this TPU without a server or scheduler.
 
-    Follows `sglang.benchmark.one_batch` (its single-rank path): resolve the
-    server arguments, publish this process as rank 0, then build the
-    `ModelRunner` with its KV pool and attention backends.
+    The single-rank steps of `sglang.benchmark.one_batch.load_model`: resolve the
+    server arguments, publish this process as rank 0, initialize the TPU worker
+    and the parallel runtime, then build the `ModelRunner` with its KV pool and
+    attention backends. No graph runner is built: the exporter traces the
+    forward itself.
     """
-    from sglang.benchmark import one_batch
+    from sglang.srt.configs.model_config import ModelConfig
+    from sglang.srt.distributed import bootstrap
     from sglang.srt.entrypoints.engine import _set_envs_and_config
-    from sglang.srt.runtime_context import publish
+    from sglang.srt.layers.moe import initialize_moe_config
+    from sglang.srt.layers.quantization.fp4_utils import initialize_fp4_gemm_config
+    from sglang.srt.layers.quantization.fp8_utils import initialize_fp8_gemm_config
+    from sglang.srt.model_executor.model_runner import ModelRunner
+    from sglang.srt.arg_groups.overrides import resolving_view
+    from sglang.srt.runtime_context import (
+        SpawnRanks,
+        get_device,
+        publish,
+        spawn_world_rank,
+    )
     from sglang.srt.server_args import PortArgs
+    from sglang.srt.utils.patch_torch import initialize_torch_tpu_worker
 
     server_args.resolve_once()
     _set_envs_and_config(server_args)
@@ -84,14 +98,34 @@ def load_model_runner(server_args: Any) -> Any:
     publish(
         server_args,
         role="scheduler",
-        ranks=one_batch.SpawnRanks(
-            world_rank=one_batch.spawn_world_rank(server_args, tp_rank=0, pp_rank=0),
+        ranks=SpawnRanks(
+            world_rank=spawn_world_rank(server_args, tp_rank=0, pp_rank=0),
             gpu_id=0,
         ),
     )
-    one_batch._init_process_global_configs()
-    model_runner, _ = one_batch.load_model(server_args, port_args, gpu_id=0, tp_rank=0)
-    return model_runner
+    initialize_moe_config()
+    initialize_fp8_gemm_config()
+    initialize_fp4_gemm_config()
+
+    initialize_torch_tpu_worker(server_args, 0)
+    cfg = resolving_view(server_args)
+    model_config = ModelConfig.from_server_args(server_args)
+    bootstrap.init_parallel_runtime(
+        server_args=server_args,
+        device=get_device().device,
+        dist_port=port_args.nccl_port,
+    )
+    bootstrap.init_layer_runtime(model_config=model_config)
+    runner = ModelRunner(
+        model_config=model_config,
+        mem_fraction_static=cfg.mem_fraction_static,
+        gpu_id=0,
+        nccl_port=port_args.nccl_port,
+        server_args=server_args,
+    )
+    runner.alloc_memory_pool()
+    runner.init_attention_backends()
+    return runner
 
 
 def _chip_version() -> str:
@@ -413,11 +447,23 @@ class SglangExportableLLM(api.ExportableTextOnlyLLM):
         return updated, hidden
 
     def compute_logits(self, hidden_states: Any, lm_head_weight: Any) -> Any:
-        """`hidden_states @ lm_head_weight.T`, trimmed to the vocabulary."""
-        hf = self._runner.model_config.hf_config
-        if getattr(hf, "final_logit_softcapping", None):
-            raise NotImplementedError("final logit soft-capping is not exported yet")
-        logits = torch.matmul(hidden_states, lm_head_weight.t())
+        """Logits as SGLang's `LogitsProcessor` computes them, trimmed to the vocabulary.
+
+        Runs the processor's own LM head projection (fp32 when the model asks for
+        it) with `lm_head_weight` bound to the head, then its logit scale and final
+        soft-capping.
+        """
+        from torch.nn.utils.stateless import _reparametrize_module
+
+        processor = self._model.logits_processor
+        head = self._model.lm_head
+        with _reparametrize_module(head, {"weight": lm_head_weight}):
+            logits = processor._compute_lm_head_rows(hidden_states, head)
+        if processor.logit_scale is not None:
+            logits = logits * processor.logit_scale
+        cap = processor.final_logit_softcapping
+        if cap:
+            logits = cap * torch.tanh(logits / cap)
         return logits[..., : self._export_config.vocab_size]
 
     def sample_tokens(self, logits: Any, **kwargs: Any) -> Any:
