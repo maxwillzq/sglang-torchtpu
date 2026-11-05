@@ -38,6 +38,7 @@ def _exportable(**overrides) -> sglang_adapter.SglangExportableLLM:
     model._export_config = dataclasses.replace(cfg, **overrides)
     kv = [torch.zeros(9, 16, 2, 2, 128, dtype=torch.bfloat16) for _ in range(2)]
     model._pool = SimpleNamespace(get_state=lambda: kv)
+    model._runner = SimpleNamespace(server_args=SimpleNamespace(tp_size=1, ep_size=1))
     return model
 
 
@@ -160,3 +161,71 @@ def test_forward_rejects_extra_controls():
             block_tables=torch.zeros(12, dtype=torch.int32),
             mamba_state_indices=torch.zeros(4, dtype=torch.int32),
         )
+
+
+def _layer(**sizes):
+    layer = nn.Module()
+    for k, v in sizes.items():
+        setattr(layer, k, v)
+    layer.weight = nn.Parameter(torch.zeros(4, 4))
+    layer.weight.output_dim = 0
+    layer.weight.input_dim = 1
+    return layer
+
+
+def test_attr_sharding_reads_the_split_dim_from_the_layer():
+    model = nn.Module()
+    model.col = _layer(
+        input_size=8,
+        input_size_per_partition=8,
+        output_size=8,
+        output_size_per_partition=4,
+    )
+    model.row = _layer(
+        input_size=8,
+        input_size_per_partition=4,
+        output_size=8,
+        output_size_per_partition=8,
+    )
+    model.emb = _layer(num_embeddings_per_partition=4)
+    shard = sglang_adapter._attr_sharding
+    assert shard(model, "col.weight", model.col.weight, 2, 2) == ["tp", None]
+    assert shard(model, "row.weight", model.row.weight, 2, 2) == [None, "tp"]
+    assert shard(model, "emb.weight", model.emb.weight, 2, 2) == ["tp", None]
+    assert shard(model, "col.weight", model.col.weight, 2, 1) == [None, None]
+    assert shard(model, "x", torch.zeros(3), 1, 2) is None  # no shard attribute
+
+
+def _experts(**attrs):
+    model = nn.Module()
+    model.experts = nn.Module()
+    for k, v in attrs.items():
+        setattr(model.experts, k, v)
+    return model
+
+
+def test_moe_sharding_splits_experts_under_ep_and_intermediate_under_tp():
+    ep = _experts(moe_ep_size=2, moe_tp_size=1)
+    assert sglang_adapter._moe_sharding(ep, "experts.w13_weight", (4, 6, 8), 2) == [
+        "ep",
+        None,
+        None,
+    ]
+    tp = _experts(moe_ep_size=1, moe_tp_size=2, intermediate_size_per_partition=3)
+    tp.experts.w13_weight = nn.Parameter(torch.zeros(4, 6, 8))
+    tp.experts.w2_weight = nn.Parameter(torch.zeros(4, 8, 3))
+    assert sglang_adapter._moe_sharding(tp, "experts.w13_weight", (4, 6, 8), 1) == [
+        None,
+        "tp",
+        None,
+    ]
+    assert sglang_adapter._moe_sharding(tp, "experts.w2_weight", (4, 8, 3), 1) == [
+        None,
+        None,
+        "tp",
+    ]
+    # A scale is sharded like its weight.
+    assert sglang_adapter._moe_sharding(
+        tp, "experts.w13_weight_scale_inv", (4, 6, 1), 1
+    ) == [None, "tp", None]
+    assert sglang_adapter._moe_sharding(tp, "mlp.gate.weight", (4, 8), 1) is None
