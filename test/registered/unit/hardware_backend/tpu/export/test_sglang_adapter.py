@@ -39,6 +39,8 @@ def _exportable(**overrides) -> sglang_adapter.SglangExportableLLM:
     kv = [torch.zeros(9, 16, 2, 2, 128, dtype=torch.bfloat16) for _ in range(2)]
     model._pool = SimpleNamespace(get_state=lambda: kv)
     model._runner = SimpleNamespace(server_args=SimpleNamespace(tp_size=1, ep_size=1))
+    model._hybrid = False
+    model._layout = [("kv", 0), ("kv", 1)]
     return model
 
 
@@ -159,7 +161,7 @@ def test_forward_rejects_extra_controls():
             query_start_loc=torch.zeros(5, dtype=torch.int32),
             req_dist=torch.zeros(3, dtype=torch.int32),
             block_tables=torch.zeros(12, dtype=torch.int32),
-            mamba_state_indices=torch.zeros(4, dtype=torch.int32),
+            mamba_slot_read_offsets=torch.zeros(5, dtype=torch.int32),
         )
 
 
@@ -229,3 +231,54 @@ def test_moe_sharding_splits_experts_under_ep_and_intermediate_under_tp():
         tp, "experts.w13_weight_scale_inv", (4, 6, 1), 1
     ) == [None, "tp", None]
     assert sglang_adapter._moe_sharding(tp, "mlp.gate.weight", (4, 8), 1) is None
+
+
+def _hybrid_exportable():
+    """Layers 0-2 linear (GDN), layer 3 full attention, as Qwen3.5 interleaves them."""
+    model = _exportable()
+    kv = torch.zeros(9, 16, 2, 2, 128, dtype=torch.bfloat16)
+    conv = [torch.zeros(5, 3, 1, 64) for _ in range(3)]
+    rec = [torch.zeros(5, 4, 32, 32) for _ in range(3)]
+    state = [kv, *conv, *rec]  # SGLang's order: full KV, conv, recurrent
+    model._pool = SimpleNamespace(get_state=lambda: state)
+    model._hybrid = True
+    model._runner = SimpleNamespace(
+        server_args=SimpleNamespace(tp_size=1, ep_size=1),
+        token_to_kv_pool=SimpleNamespace(full_attention_layer_id_mapping={3: 0}),
+        req_to_token_pool=SimpleNamespace(mamba_map={0: 0, 1: 1, 2: 2}),
+    )
+    model._layout = model._state_layout()
+    return model, state
+
+
+def test_hybrid_state_layout_is_per_layer_in_layer_order():
+    model, _ = _hybrid_exportable()
+    assert model._layout == [
+        ("conv", 1),
+        ("rec", 4),
+        ("conv", 2),
+        ("rec", 5),
+        ("conv", 3),
+        ("rec", 6),
+        ("kv", 0),
+    ]
+    assert [x[0] for x in model._layout].count("kv") == 1
+
+
+def test_hybrid_states_round_trip_between_orders():
+    model, state = _hybrid_exportable()
+    artifact_order = model._from_sglang_order(state)
+    assert artifact_order[0] is state[1] and artifact_order[1] is state[4]
+    assert artifact_order[-1] is state[0]
+    back = model._to_sglang_order(artifact_order)
+    assert all(a is b for a, b in zip(back, state))
+
+
+def test_hybrid_abstract_states_size_recurrent_pools_by_state_slots():
+    model, _ = _hybrid_exportable()
+    specs = model.abstract_states()
+    num_state_slots = model.export_config.num_state_slots  # max_num_seqs + 1
+    assert specs[0].shape == (num_state_slots, 3, 1, 64)  # L0 conv
+    assert specs[1].shape == (num_state_slots, 4, 32, 32)  # L0 recurrent
+    assert specs[-1].shape == (9, 16, 2, 2, 128)  # L3 KV
+    assert model.extra_user_inputs() == [("mamba_state_indices", (4,))]
