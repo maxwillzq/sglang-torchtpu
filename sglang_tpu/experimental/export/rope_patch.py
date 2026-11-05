@@ -223,8 +223,15 @@ def _in_graph_rope_forward(
     query: torch.Tensor,
     key: torch.Tensor | None = None,
     offsets: torch.Tensor | None = None,
+    fused_set_kv_buffer_arg: Any = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
-    """In-graph `RotaryEmbedding` / `MRotaryEmbedding` forward, no `cos_sin_cache`."""
+    """In-graph `RotaryEmbedding` / `MRotaryEmbedding` forward, no `cos_sin_cache`.
+
+    `fused_set_kv_buffer_arg` is SGLang's: a caller may pass it (None) to the
+    rotary forward; fusing the KV write into RoPE is not supported here.
+    """
+    if fused_set_kv_buffer_arg is not None:
+        raise NotImplementedError("RoPE with a fused KV-buffer write is not exported")
     if offsets is not None:
         positions = positions + offsets
 
