@@ -68,6 +68,7 @@ logger = logging.getLogger(__name__)
 # The exporter and the checkpoint writer look an MTP draft up under this
 # attribute; SGLang models are exported without one.
 MTP_DRAFT_ATTR = "_export_mtp_draft"
+_MTP_NAMES_ATTR = "_export_mtp_names"
 
 # Buffers become graph constants; anything larger belongs in the checkpoint.
 _MAX_CONSTANT_ELEMENTS = 1024
@@ -84,6 +85,11 @@ def mtp_draft_names(model: nn.Module) -> dict[str, str]:
     draft = getattr(model, MTP_DRAFT_ATTR, None)
     if draft is None:
         return {}
+    # Sharing is by object identity, which holds only until lowering swaps the
+    # target's parameters, so the first answer is kept for the model's lifetime.
+    cached = getattr(model, _MTP_NAMES_ATTR, None)
+    if cached is not None:
+        return cached
     target: dict[int, str] = {}
     for named in (model.named_parameters, model.named_buffers):
         for n, t in named():
@@ -92,6 +98,7 @@ def mtp_draft_names(model: nn.Module) -> dict[str, str]:
     for named in (draft.named_parameters, draft.named_buffers):
         for n, t in named(remove_duplicate=False):
             names.setdefault(n, target.get(id(t), "mtp." + n.removeprefix("model.")))
+    object.__setattr__(model, _MTP_NAMES_ATTR, names)
     return names
 
 
@@ -213,6 +220,7 @@ def load_model_runner(server_args: Any, tp_rank: int = 0, port_args: Any = None)
         object.__setattr__(
             runner.model, MTP_DRAFT_ATTR, draft_worker.model_runner.model
         )
+        mtp_draft_names(runner.model)  # fix the names while sharing is visible
     return runner
 
 
