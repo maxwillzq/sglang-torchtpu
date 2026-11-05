@@ -312,6 +312,23 @@ def test_mtp_draft_names_keep_shared_tensors_and_prefix_the_drafts_own():
     )
 
 
+def test_mtp_draft_names_survive_the_target_swapping_its_parameters():
+    # Lowering reparametrizes the target, which breaks object identity with the
+    # draft; a shared tensor must keep the target's name afterwards.
+    target = nn.Module()
+    target.embed = nn.Embedding(4, 2)
+    draft = nn.Module()
+    draft.embed = nn.Module()
+    draft.embed.weight = target.embed.weight
+    object.__setattr__(target, sglang_adapter.MTP_DRAFT_ATTR, draft)
+    assert sglang_adapter.mtp_draft_names(target) == {"embed.weight": "embed.weight"}
+
+    target.embed.weight = nn.Parameter(torch.zeros(4, 2))
+
+    assert sglang_adapter.mtp_draft_names(target) == {"embed.weight": "embed.weight"}
+    assert sglang_adapter.mtp_draft_tensors(target) == {}
+
+
 def test_mtp_draft_names_without_a_draft_are_empty():
     assert sglang_adapter.mtp_draft_names(nn.Linear(2, 2)) == {}
     assert sglang_adapter.mtp_draft_tensors(nn.Linear(2, 2)) == {}
