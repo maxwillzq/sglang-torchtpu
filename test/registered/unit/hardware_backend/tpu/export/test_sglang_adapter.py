@@ -41,6 +41,7 @@ def _exportable(**overrides) -> sglang_adapter.SglangExportableLLM:
     model._runner = SimpleNamespace(server_args=SimpleNamespace(tp_size=1, ep_size=1))
     model._hybrid = False
     model._layout = [("kv", 0), ("kv", 1)]
+    model._draft = None
     return model
 
 
@@ -161,7 +162,7 @@ def test_forward_rejects_extra_controls():
             query_start_loc=torch.zeros(5, dtype=torch.int32),
             req_dist=torch.zeros(3, dtype=torch.int32),
             block_tables=torch.zeros(12, dtype=torch.int32),
-            mamba_slot_read_offsets=torch.zeros(5, dtype=torch.int32),
+            unknown_control=torch.zeros(5, dtype=torch.int32),
         )
 
 
@@ -282,3 +283,74 @@ def test_hybrid_abstract_states_size_recurrent_pools_by_state_slots():
     assert specs[1].shape == (num_state_slots, 4, 32, 32)  # L0 recurrent
     assert specs[-1].shape == (9, 16, 2, 2, 128)  # L3 KV
     assert model.extra_user_inputs() == [("mamba_state_indices", (4,))]
+
+
+def test_mtp_draft_names_keep_shared_tensors_and_prefix_the_drafts_own():
+    target = nn.Module()
+    target.embed = nn.Embedding(4, 2)
+    draft = nn.Module()
+    draft.model = nn.Module()
+    draft.model.embed_tokens = nn.Module()
+    draft.model.embed_tokens.weight = target.embed.weight  # shared with the target
+    draft.fc = nn.Linear(4, 2, bias=False)
+    draft.model.norm = nn.LayerNorm(2)
+    object.__setattr__(target, sglang_adapter.MTP_DRAFT_ATTR, draft)
+
+    names = sglang_adapter.mtp_draft_names(target)
+
+    assert names["model.embed_tokens.weight"] == "embed.weight"
+    assert names["fc.weight"] == "mtp.fc.weight"
+    assert names["model.norm.weight"] == "mtp.norm.weight"
+    assert set(sglang_adapter.mtp_draft_tensors(target)) == {
+        "mtp.fc.weight",
+        "mtp.norm.weight",
+        "mtp.norm.bias",
+    }
+    # The draft is off the target's module tree.
+    assert not any(
+        n.startswith("mtp") or "fc" in n for n, _ in target.named_parameters()
+    )
+
+
+def test_mtp_draft_names_without_a_draft_are_empty():
+    assert sglang_adapter.mtp_draft_names(nn.Linear(2, 2)) == {}
+    assert sglang_adapter.mtp_draft_tensors(nn.Linear(2, 2)) == {}
+
+
+class _GdnBackend:
+    def __init__(self):
+        self._num_spec_tokens = 0
+        self.calls = []
+        self._op = lambda *a, **kw: self.calls.append(kw) or "out"
+
+    def _state_rows(self):
+        return "own rows", None
+
+
+def test_gdn_artifact_layout_reads_the_artifact_slots_and_runs_both_segments():
+    backend = _GdnBackend()
+    base, offsets = torch.tensor([1, 4]), torch.tensor([0, 2])
+    with sglang_adapter._gdn_artifact_layout(backend, base, offsets, 2):
+        rows, offs = backend._state_rows()
+        assert rows is base and offs is offsets
+        assert backend._num_spec_tokens == 2
+        backend._op(1, batched_only=True, prefill_only=False)
+    assert backend.calls == [{"batched_only": False, "prefill_only": False}]
+    # Restored afterwards.
+    assert backend._state_rows() == ("own rows", None)
+    assert backend._num_spec_tokens == 0
+    assert "_state_rows" not in backend.__dict__
+
+
+def test_hybrid_with_verify_windows_declares_offsets_and_checkpoint_rows():
+    model, _ = _hybrid_exportable()
+    model._export_config = dataclasses.replace(
+        model._export_config,
+        speculative_config={"method": "mtp", "num_speculative_tokens": 2},
+    )
+    assert model.export_config.recurrent_window == 3
+    assert model.extra_user_inputs() == [
+        ("mamba_state_indices", (4,)),
+        ("mamba_slot_read_offsets", (4 * 3 + 1,)),
+        ("mamba_ckpt_indices", (4, 3)),
+    ]

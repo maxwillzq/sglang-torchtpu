@@ -36,8 +36,17 @@ order (`[L0.conv, L0.rec, ..., L3.kv, ...]`, as vLLM's export does); SGLang keep
 them as the full KV caches, then every conv, then every recurrent state, so the
 adapter permutes between the two.
 
-Supported: text decoders (dense, MoE, or hybrid GDN without speculative
-decoding) on the RPA v3 backend.
+With MTP speculative decoding (`--speculative-algorithm NEXTN`), SGLang's MTP
+draft is loaded beside the target and exported as `draft_bucket{B}` with vLLM's
+semantics (`mtp_draft`); the draft's own weights are named `mtp.*`, and the
+target's embedding and LM head are shared. A hybrid target then keeps
+`recurrent_window` consecutive state slots per request, as the artifact contract
+lays them out: the forward reads each request's state at `mamba_state_indices +
+mamba_slot_read_offsets[mamba_state_indices]` and writes verify checkpoint `t` to
+`mamba_state_indices + t`, bypassing SGLang's request-row window layout.
+
+Supported: text decoders (dense, MoE, hybrid GDN, with or without MTP drafting)
+on the RPA v3 backend.
 """
 
 from __future__ import annotations
@@ -65,10 +74,39 @@ _MAX_CONSTANT_ELEMENTS = 1024
 _MIN_REQ_BUCKET = 8
 
 
+def mtp_draft_names(model: nn.Module) -> dict[str, str]:
+    """Export name of each draft tensor, by the draft's own name.
+
+    A tensor the draft shares with the target (its embedding, a tied or shared LM
+    head) keeps the target's name; the draft's own tensors are `mtp.` plus their
+    name without a leading `model.`, as vLLM's export names them.
+    """
+    draft = getattr(model, MTP_DRAFT_ATTR, None)
+    if draft is None:
+        return {}
+    target: dict[int, str] = {}
+    for named in (model.named_parameters, model.named_buffers):
+        for n, t in named():
+            target.setdefault(id(t), n)
+    names: dict[str, str] = {}
+    for named in (draft.named_parameters, draft.named_buffers):
+        for n, t in named(remove_duplicate=False):
+            names.setdefault(n, target.get(id(t), "mtp." + n.removeprefix("model.")))
+    return names
+
+
 def mtp_draft_tensors(model: nn.Module) -> dict[str, Any]:
-    """The MTP draft's own tensors by export name; SGLang exports carry none."""
-    del model
-    return {}
+    """The MTP draft's own tensors (not shared with the target), by export name."""
+    draft = getattr(model, MTP_DRAFT_ATTR, None)
+    if draft is None:
+        return {}
+    names = mtp_draft_names(model)
+    out: dict[str, Any] = {}
+    for named in (draft.named_parameters, draft.named_buffers):
+        for n, t in named(remove_duplicate=False):
+            if names[n].startswith("mtp."):
+                out[names[n]] = t
+    return out
 
 
 def default_req_buckets(max_num_seqs: int) -> tuple[int, ...]:
@@ -151,8 +189,30 @@ def load_model_runner(server_args: Any, tp_rank: int = 0, port_args: Any = None)
         nccl_port=port_args.nccl_port,
         server_args=server_args,
     )
+    # MTP drafting: the draft worker is built before the target's pools and shares
+    # them (page table and allocator), as SGLang's scheduler builds it.
+    draft_worker = None
+    if getattr(server_args, "speculative_algorithm", None):
+        from sglang_tpu.experimental.speculative.mtp.mtp_draft_worker import (
+            TpuMtpDraftWorker,
+        )
+
+        draft_worker = TpuMtpDraftWorker(runner)
     runner.alloc_memory_pool()
+    if draft_worker is not None:
+        draft_worker.alloc_memory_pool(
+            memory_pool_config=runner.memory_pool_config,
+            req_to_token_pool=runner.req_to_token_pool,
+            token_to_kv_pool_allocator=runner.token_to_kv_pool_allocator,
+        )
     runner.init_attention_backends()
+    if draft_worker is not None:
+        draft_worker.init_attention_backends()
+        runner._export_draft_worker = draft_worker
+        # Off the target's module tree, so the target's parameters stay its own.
+        object.__setattr__(
+            runner.model, MTP_DRAFT_ATTR, draft_worker.model_runner.model
+        )
     return runner
 
 
@@ -200,6 +260,19 @@ class SglangExportableLLM(api.ExportableTextOnlyLLM):
         else:
             self._rpa = self._backend
             self._pool = model_runner.token_to_kv_pool
+        self._draft_worker = getattr(model_runner, "_export_draft_worker", None)
+        self._draft: nn.Module | None = None
+        if self._draft_worker is not None:
+            draft_runner = self._draft_worker.model_runner
+            self._draft = draft_runner.model
+            self._draft_backend = draft_runner.attn_backend
+            # A hybrid target wraps the draft's one attention layer in a hybrid backend
+            # and pool too; the draft owns only their full-attention part.
+            self._draft_rpa = getattr(
+                self._draft_backend, "full_attn_backend", self._draft_backend
+            )
+            pool = draft_runner.token_to_kv_pool
+            self._draft_pool = getattr(pool, "full_kv_pool", pool)
         self._layout = self._state_layout()
         self._check_supported()
         self._export_config = self._build_export_config(options)
@@ -207,6 +280,11 @@ class SglangExportableLLM(api.ExportableTextOnlyLLM):
             self._model
         )
         self._patched_embeddings = _patch_vocab_shard_bounds(self._model)
+        if self._draft is not None:
+            self._patched_rope_modules += rope_patch.patch_in_graph_rotary_embedding(
+                self._draft
+            )
+            self._patched_embeddings += _patch_vocab_shard_bounds(self._draft)
         self._forward_batches: dict[int, Any] = {}
 
     # ------------------------------------------------------------------ setup
@@ -285,6 +363,21 @@ class SglangExportableLLM(api.ExportableTextOnlyLLM):
         eos = getattr(hf, "eos_token_id", None)
         if isinstance(eos, (list, tuple)):
             eos = eos[0]
+        speculative_config = None
+        max_req = max_num_seqs
+        if self._draft is not None:
+            k = int(server_args.speculative_num_steps)
+            num_draft_tokens = getattr(
+                server_args, "speculative_num_draft_tokens", None
+            )
+            if num_draft_tokens is not None and int(num_draft_tokens) != k + 1:
+                raise ValueError(
+                    f"MTP export drafts chains: --speculative-num-draft-tokens must be "
+                    f"--speculative-num-steps + 1 ({k + 1}), got {num_draft_tokens}"
+                )
+            speculative_config = {"method": "mtp", "num_speculative_tokens": k}
+            # compute_logits and the samplers see up to k + 1 rows per request.
+            max_req = min(max_num_seqs * (k + 1), max(options.token_buckets))
         return api.TextOnlyLLMExportConfig(
             model_name=str(server_args.served_model_name or server_args.model_path),
             target_tpu=options.target_tpu or _chip_version(),
@@ -304,8 +397,9 @@ class SglangExportableLLM(api.ExportableTextOnlyLLM):
             eos_token_id=int(eos) if eos is not None else 0,
             dtype=tpu_lowering.dtype_name(cfg.dtype),
             token_buckets=tuple(options.token_buckets),
-            req_buckets=tuple(options.req_buckets or default_req_buckets(max_num_seqs)),
+            req_buckets=tuple(options.req_buckets or default_req_buckets(max_req)),
             hf_checkpoint_dir=str(server_args.model_path),
+            speculative_config=speculative_config,
         )
 
     # --------------------------------------------------------------- protocol
@@ -355,7 +449,60 @@ class SglangExportableLLM(api.ExportableTextOnlyLLM):
         tied = weight_mapper.tied_lm_head_alias(params)
         if tied:
             params[tied[0]] = params[tied[1]]
+        params.update(self._mtp_abstract_params())
         return params
+
+    def _mtp_abstract_params(self) -> dict[str, api.ShapeDtypeStruct]:
+        """The draft's own parameters and buffers by their `mtp.` names; shardings
+        come from the draft's own layers."""
+        from sglang_tpu.experimental.export import weight_mapper
+
+        if self._draft is None:
+            return {}
+        tp = self._tp_size()
+        names = mtp_draft_names(self._model)
+        params: dict[str, api.ShapeDtypeStruct] = {}
+        for name, param in self._draft.named_parameters():
+            if not names[name].startswith("mtp."):
+                continue
+            shape = tuple(int(d) for d in param.shape)
+            sharding = _moe_sharding(self._draft, name, shape, self._ep_size())
+            if sharding is None:
+                sharding = _attr_sharding(self._draft, name, param, len(shape), tp)
+            if sharding is None:
+                sharding = weight_mapper.infer_weight_sharding(
+                    name, shape, model=self._draft, tp_size_hint=tp
+                )
+            params[names[name]] = api.ShapeDtypeStruct(
+                shape=shape,
+                dtype=tpu_lowering.dtype_name(param.dtype),
+                sharding=sharding,
+            )
+        for name, buf in self._draft.named_buffers():
+            if names[name].startswith("mtp."):
+                params.setdefault(
+                    names[name],
+                    api.ShapeDtypeStruct(
+                        shape=tuple(buf.shape), dtype=tpu_lowering.dtype_name(buf.dtype)
+                    ),
+                )
+        return params
+
+    def _buffers(self) -> dict[str, Any]:
+        """The target's buffers and the draft's own, by export name."""
+        bufs = dict(self._model.named_buffers())
+        bufs.update(
+            {n: t for n, t in mtp_draft_tensors(self._model).items() if n not in bufs}
+        )
+        return bufs
+
+    def _lm_head_name(self) -> str:
+        """The export name of the LM head weight (a tied head's alias)."""
+        from sglang_tpu.experimental.export import weight_mapper
+
+        names = [n for n, _ in self._model.named_parameters()]
+        tied = weight_mapper.tied_lm_head_alias(names)
+        return tied[0] if tied else "lm_head.weight"
 
     def _ep_size(self) -> int:
         return int(getattr(self._runner.server_args, "ep_size", 1) or 1)
@@ -363,11 +510,14 @@ class SglangExportableLLM(api.ExportableTextOnlyLLM):
     def constant_names(self) -> set[str]:
         """Names in `abstract_params()` that are buffers rather than parameters."""
         params = {name for name, _ in self._model.named_parameters()}
-        return {name for name, _ in self._model.named_buffers() if name not in params}
+        if self._draft is not None:
+            names = mtp_draft_names(self._model)
+            params |= {names[n] for n, _ in self._draft.named_parameters()}
+        return {name for name in self._buffers() if name not in params}
 
     def constant_axis_values(self, name: str) -> list[Any]:
         """The buffer's value on every tensor-parallel rank (one rank here)."""
-        buf = dict(self._model.named_buffers())[name]
+        buf = self._buffers()[name]
         if buf.numel() > _MAX_CONSTANT_ELEMENTS:
             raise ValueError(
                 f"buffer {name} has {buf.numel()} elements; constants are limited to "
@@ -423,11 +573,35 @@ class SglangExportableLLM(api.ExportableTextOnlyLLM):
             )
         return specs
 
+    def mtp_abstract_states(self) -> Sequence[api.ShapeDtypeStruct]:
+        """The draft's paged KV caches, laid out like a target KV cache."""
+        if self._draft is None:
+            raise ValueError("the model has no MTP draft")
+        cfg = self._export_config
+        tp = self._tp_size() > 1
+        return [
+            api.ShapeDtypeStruct(
+                shape=(cfg.num_blocks, *tuple(t.shape[1:])),
+                dtype=tpu_lowering.dtype_name(t.dtype),
+                sharding=(None, None, "model" if tp else None, None, None)[: t.dim()],
+            )
+            for t in self._draft_pool.get_state()
+        ]
+
     def extra_user_inputs(self) -> list[tuple[str, tuple[int, ...]]]:
-        """Hybrid models take each request's recurrent state slot after the states."""
+        """Hybrid models take each request's recurrent state slot after the states;
+        with verify windows also the per-slot read offsets and the checkpoint rows
+        (the latter declared for the contract; the split-state path derives them)."""
         if not self._hybrid:
             return []
-        return [("mamba_state_indices", (self._export_config.max_num_seqs,))]
+        cfg = self._export_config
+        inputs = [("mamba_state_indices", (cfg.max_num_seqs,))]
+        if cfg.recurrent_window > 1:
+            inputs += [
+                ("mamba_slot_read_offsets", (cfg.num_state_slots,)),
+                ("mamba_ckpt_indices", (cfg.max_num_seqs, cfg.recurrent_window)),
+            ]
+        return inputs
 
     def fit_num_blocks(self, num_blocks: int) -> None:
         """Declares `num_blocks` KV blocks per layer instead of SGLang's pool size."""
@@ -577,9 +751,12 @@ class SglangExportableLLM(api.ExportableTextOnlyLLM):
     ) -> tuple[Sequence[Any], Any]:
         """One continuous-batching step: SGLang's decoder over the artifact's inputs."""
         mamba_state_indices = extra_controls.pop("mamba_state_indices", None)
+        read_offsets = extra_controls.pop("mamba_slot_read_offsets", None)
+        # Checkpoint t of a request's window is its state slot + t: nothing to read.
+        extra_controls.pop("mamba_ckpt_indices", None)
         if extra_controls:
             raise NotImplementedError(
-                f"SGLang export takes no extra controls besides mamba_state_indices, "
+                f"SGLang export takes no extra controls besides the recurrent ones, "
                 f"got {sorted(extra_controls)}"
             )
         if self._hybrid and mamba_state_indices is None:
@@ -591,16 +768,24 @@ class SglangExportableLLM(api.ExportableTextOnlyLLM):
 
         num_tokens = int(input_ids.shape[0])
         batch = self._forward_batch(num_tokens)
+        # The attention kernel's distribution; a 6-element req_dist adds the
+        # recurrent kernels' after it.
         metadata = self._metadata(
             kv_lens=kv_lens,
             block_tables=block_tables,
             query_start_loc=query_start_loc,
-            req_dist=req_dist,
+            req_dist=req_dist[:3],
         )
         backbone = self._model.model
         with (
             self._bound(weights, kv_caches),
-            self._bind_metadata(metadata, mamba_state_indices, batch.forward_mode),
+            self._bind_metadata(
+                metadata,
+                req_dist,
+                mamba_state_indices,
+                read_offsets,
+                batch.forward_mode,
+            ),
             forward_context(ForwardContext(attn_backend=self._backend)),
         ):
             hidden = backbone(
@@ -611,34 +796,166 @@ class SglangExportableLLM(api.ExportableTextOnlyLLM):
             updated = self._from_sglang_order(self._pool.get_state())
         return updated, hidden
 
+    @contextlib.contextmanager
     def _bind_metadata(
-        self, rpa_metadata: Any, mamba_state_indices: Any, mode: Any
-    ) -> Any:
+        self,
+        rpa_metadata: Any,
+        req_dist: Any,
+        mamba_state_indices: Any,
+        read_offsets: Any,
+        mode: Any,
+    ) -> Iterator[None]:
         """Installs the attention metadata (and, for a hybrid model, the GDN's)."""
         if not self._hybrid:
-            return self._rpa.bind_forward_metadata(rpa_metadata, mode)
+            with self._rpa.bind_forward_metadata(rpa_metadata, mode):
+                yield
+            return
         from sglang_tpu.attention_gdn_pallas import GdnTracedMetadata
         from sglang_tpu.compilation.hybrid_linear_direct_compile import (
             bind_traced_attention_metadata,
         )
 
-        req_dist = rpa_metadata.distribution
-        # Every request in the GDN's per-sequence segment: the backend runs one
-        # kernel segment per forward (`prefill_only` outside decode), so a decode
-        # range [0, req_dist[0]) would be skipped. Correct for decodes too, if
-        # slower than the batched decode segment.
-        # TODO: a mode of TpuGDNAttnBackend that runs both segments.
-        zeros = torch.zeros(2, dtype=req_dist.dtype, device=req_dist.device)
+        window = self._export_config.recurrent_window
+        # The recurrent kernels' distribution: its windowed segment covers decodes
+        # and verify windows, its per-sequence segment the rest.
+        gdn_dist = req_dist[3:6] if req_dist.shape[0] == 6 else req_dist[:3]
+        base = mamba_state_indices.to(torch.int32)
+        offsets = None
+        if window > 1:
+            if read_offsets is None:
+                raise ValueError(
+                    "a forward with verify windows needs mamba_slot_read_offsets"
+                )
+            offsets = read_offsets.to(torch.int32).index_select(
+                0, base.clamp(min=0).to(torch.int64)
+            )
         gdn = GdnTracedMetadata(
-            distribution=torch.cat([zeros, req_dist[2:3]]),
+            distribution=gdn_dist,
             seq_lens=rpa_metadata.kv_lens,
-            state_indices=mamba_state_indices.to(torch.int32),
+            state_indices=base,
             query_start_loc=rpa_metadata.cu_q_lens,
             track_indices=None,
             track_end=None,
             read_offsets=None,
         )
-        return bind_traced_attention_metadata(self._backend, (rpa_metadata, gdn), mode)
+        with (
+            bind_traced_attention_metadata(self._backend, (rpa_metadata, gdn), mode),
+            _gdn_artifact_layout(
+                self._backend.linear_attn_backend, base, offsets, window - 1
+            ),
+        ):
+            yield
+
+    # -------------------------------------------------------------- MTP draft
+
+    def mtp_draft(
+        self,
+        weights: Mapping[str, Any],
+        kv_caches: Sequence[Any],
+        *,
+        input_ids: Any,
+        positions: Any,
+        kv_lens: Any,
+        block_tables: Any,
+        query_start_loc: Any,
+        req_dist: Any,
+        last_token_indices: Any,
+        hidden_states: Any,
+    ) -> tuple[Sequence[Any], Any]:
+        """Drafts `k` tokens per request with the MTP draft, as vLLM's export does.
+
+        The first pass runs the draft over every row of the step (`input_ids`
+        shifted by one token, the target's `hidden_states`), writing the draft's KV
+        for each row; each request's first draft comes from its row
+        `last_token_indices`. Each further pass feeds every request its last draft
+        and the draft's own hidden state, one token per request at the next
+        position.
+        """
+        from sglang.srt.model_executor.forward_context import (
+            ForwardContext,
+            forward_context,
+        )
+        from torch.nn.utils.stateless import _reparametrize_module
+
+        draft = self._draft
+        if draft is None:
+            raise ValueError("the model has no MTP draft")
+        cfg = self._export_config
+        k = int(cfg.speculative_config["num_speculative_tokens"])  # type: ignore[index]
+        names = mtp_draft_names(self._model)
+        call = {
+            d: weights[e]
+            for d, e in names.items()
+            if e in weights and isinstance(weights[e], torch.Tensor)
+        }
+        call.update(_aliases(draft, call))
+        lm_head = weights[self._lm_head_name()]
+
+        def run(ids: Any, pos: Any, hidden: Any, metadata: Any) -> Any:
+            batch = self._forward_batch(int(ids.shape[0]))
+            with self._draft_rpa.bind_forward_metadata(metadata, batch.forward_mode):
+                ids = ids.to(torch.int64)
+                # Qwen3_5ForCausalLMMTP.forward without its spec_info plumbing.
+                emb = draft.pre_fc_norm_embedding(draft.model.embed_tokens(ids))
+                h = draft.fc(torch.cat([emb, draft.pre_fc_norm_hidden(hidden)], dim=-1))
+                out = draft.model(ids, pos.to(torch.int64), batch, h)
+                return out[0] if isinstance(out, tuple) else out
+
+        def greedy(hidden: Any) -> Any:
+            return self.compute_logits(hidden, lm_head).argmax(dim=-1).to(torch.int32)
+
+        saved = self._draft_pool.get_state()
+        self._draft_pool.set_state(list(kv_caches))
+        try:
+            with (
+                _reparametrize_module(draft, call, strict=False),
+                forward_context(ForwardContext(attn_backend=self._draft_backend)),
+            ):
+                hidden = run(
+                    input_ids,
+                    positions,
+                    hidden_states,
+                    self._metadata(
+                        kv_lens=kv_lens,
+                        block_tables=block_tables,
+                        query_start_loc=query_start_loc,
+                        req_dist=req_dist[:3],
+                    ),
+                )
+                rows = last_token_indices.to(torch.int64)
+                hidden = hidden.index_select(0, rows)
+                drafts = [greedy(hidden)]
+                if k > 1:
+                    num_seqs = req_dist[2]
+                    live = torch.arange(cfg.max_num_seqs, device=rows.device) < num_seqs
+                    # KV index of each request's row `last_token_indices`: its KV
+                    # length less the rows after it in the step.
+                    last_kv = (
+                        kv_lens - (query_start_loc[1:] - rows.to(kv_lens.dtype) - 1) - 1
+                    )
+                    one_per_seq = torch.clamp(
+                        torch.arange(cfg.max_num_seqs + 1, device=rows.device),
+                        max=num_seqs,
+                    ).to(query_start_loc.dtype)
+                    all_decode = torch.stack([num_seqs, num_seqs, num_seqs]).to(
+                        req_dist.dtype
+                    )
+                    last_pos = positions.index_select(-1, rows)
+                    for step in range(1, k):
+                        metadata = self._metadata(
+                            kv_lens=torch.where(live, last_kv + step + 1, 0).to(
+                                kv_lens.dtype
+                            ),
+                            block_tables=block_tables,
+                            query_start_loc=one_per_seq,
+                            req_dist=all_decode,
+                        )
+                        hidden = run(drafts[-1], last_pos + step, hidden, metadata)
+                        drafts.append(greedy(hidden))
+                updated = list(self._draft_pool.get_state())
+        finally:
+            self._draft_pool.set_state(saved)
+        return updated, torch.stack(drafts, dim=1)
 
     def compute_logits(self, hidden_states: Any, lm_head_weight: Any) -> Any:
         """Logits as SGLang's `LogitsProcessor` computes them, trimmed to the vocabulary.
@@ -877,3 +1194,42 @@ def _aliases(model: nn.Module, weights: Mapping[str, Any]) -> dict[str, Any]:
             ):
                 out[name] = weights[first]
     return out
+
+
+@contextlib.contextmanager
+def _gdn_artifact_layout(
+    backend: Any, base: Any, offsets: Any, num_spec_tokens: int
+) -> Iterator[None]:
+    """Runs SGLang's GDN backend on the artifact's recurrent state layout.
+
+    The artifact gives each request `num_spec_tokens + 1` consecutive state slots
+    from `base` (`mamba_state_indices`) and per-request read offsets into them, the
+    layout the GDN kernel addresses natively; SGLang's own backend instead maps
+    request-pool rows to checkpoint windows (`_state_rows`) and runs one kernel
+    segment per forward. For the trace, the backend reads `(base, offsets)` as is,
+    verifies `num_spec_tokens` drafts per window, and runs both kernel segments
+    (windowed decodes and verifies, then per-sequence prefills), so mixed batches
+    need no host-side split.
+    """
+    had_rows = "_state_rows" in backend.__dict__
+    saved_rows = backend.__dict__.get("_state_rows")
+    saved_spec = backend._num_spec_tokens
+    saved_op = backend._op
+
+    def both_segments(*args: Any, **kwargs: Any) -> Any:
+        kwargs["batched_only"] = False
+        kwargs["prefill_only"] = False
+        return saved_op(*args, **kwargs)
+
+    backend._state_rows = lambda: (base, offsets)
+    backend._num_spec_tokens = num_spec_tokens
+    backend._op = both_segments
+    try:
+        yield
+    finally:
+        backend._op = saved_op
+        backend._num_spec_tokens = saved_spec
+        if had_rows:
+            backend._state_rows = saved_rows
+        else:
+            del backend._state_rows
