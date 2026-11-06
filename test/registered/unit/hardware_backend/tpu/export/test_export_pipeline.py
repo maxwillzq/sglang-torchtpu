@@ -543,7 +543,10 @@ def test_metadata_has_one_serving_config_with_what_the_runtime_reads(tmp_path) -
         "pipeline_parallel_size",
         "data_parallel_size",
         "tokenizer_config",
+        "checkpoint_config",
     }
+    # The checkpoint format every export writes (Zarr v2 arrays in an OCDBT database).
+    assert meta["serving_config"]["checkpoint_config"] == {"format": "zarr2_ocdbt"}
     assert (serving["vocab_size"], serving["num_blocks"]) == (32, 16)
 
 
