@@ -88,9 +88,22 @@ the forward takes `mamba_state_indices[max_num_seqs]`, each request's slot.
 Every request currently runs the GDN kernel's per-sequence segment (correct,
 slower than the batched decode segment for decode steps).
 
+## Speculative decoding (MTP)
+
+With `--speculative-algorithm NEXTN` (and `--speculative-num-steps`, which sets the number of
+draft tokens), the artifact also holds `draft_bucket{B}` modules for the model's MTP layer. The
+target forward takes verify windows of recurrent state. The draft's own weights are exported as
+`mtp.*`, and the tensors it shares with the target, such as the embedding and a tied LM head,
+keep the target's names. The layout is the rvllm/vLLM one: the adapter rebuilds the GDN metadata
+for it rather than using SGLang's own spec-decoding windows. Verified on Qwen3.5-0.8B.
+
+## Results
+
+[RESULTS.md](RESULTS.md) has parity and throughput against `sglang.launch_server` for the
+models measured so far.
+
 ## Not supported yet
 
-- speculative decoding (MTP drafts, verify windows of recurrent state);
 - `--export-mode checkpoint` (CPU-only weight export);
 - attention backends other than RPA v3; MLA models.
 
