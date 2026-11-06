@@ -16,15 +16,20 @@
 An artifact's weights are the ones vLLM serves with, including any it computes
 while loading (FP8 requantization, dtype casts). The `checkpoint` and `all`
 export modes save every `abstract_params` input `i` as array `array_{i}` of an
-Orbax checkpoint (Zarr v2, no OCDBT) in `serving_checkpoint/data`, from the
-weights of the loaded model:
-one process per tensor-parallel rank (a CPU process for `checkpoint`, the TPU
+Orbax checkpoint in `serving_checkpoint/data`, from the weights of the loaded
+model. The arrays are Zarr v2 arrays in a TensorStore OCDBT database, the Orbax
+default (`CHECKPOINT_FORMAT`): their chunks are packed into a few large data
+files, so a runtime that reads the checkpoint in place over a network file
+system pays a few file opens instead of one per chunk. The artifact declares the
+format in `serving_config.checkpoint_config`.
+
+One process per tensor-parallel rank (a CPU process for `checkpoint`, the TPU
 export worker for `all`) saves its rank's shards. The processes join a JAX
 distributed runtime before any JAX use, and the arrays are laid out on a mesh of
 their CPU devices, so Orbax writes each array's chunks from the processes that
 hold them without copying weights to TPU memory. Orbax writes one chunk per shard,
 and splits a replicated array among the processes holding it, so a small array (a
-per-layer norm or bias) would become one tiny file per rank; an array of at most
+per-layer norm or bias) would become one tiny chunk per rank; an array of at most
 `SMALL_ARRAY_BYTES` is saved as one chunk instead. The chunk layout is recorded
 in each array's `.zarray`, so readers need no change.
 """
@@ -49,6 +54,9 @@ DATA_DIR_FLAG = "--checkpoint-data-dir"
 _AXIS_NAMES = ("data", "model")
 # Checkpoint arrays `array_{i}` live here, relative to the artifact directory.
 CHECKPOINT_DATA_DIR = os.path.join("serving_checkpoint", "data")
+# How the checkpoint is stored, as `serving_config.checkpoint_config.format`
+# declares it: Zarr v2 arrays in a TensorStore OCDBT database (Orbax `use_ocdbt`).
+CHECKPOINT_FORMAT = "zarr2_ocdbt"
 # A sharded array of at most this many bytes (all shards together) is saved as one
 # chunk rather than one chunk per shard.
 SMALL_ARRAY_BYTES = 4 << 20
@@ -267,7 +275,9 @@ def _save_checkpoint(
     )
     checkpointer = ocp.Checkpointer(
         ocp.PyTreeCheckpointHandler(
-            use_ocdbt=False, use_zarr3=False, type_handler_registry=registry
+            use_ocdbt=CHECKPOINT_FORMAT == "zarr2_ocdbt",
+            use_zarr3=False,
+            type_handler_registry=registry,
         )
     )
     checkpointer.save(
